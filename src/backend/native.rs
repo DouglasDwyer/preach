@@ -357,32 +357,3 @@ impl From<&RtcDataChannelConfiguration<'_>> for datachannel::DataChannelInit {
             }).negotiated().manual_stream()
     }
 }
-
-struct PollFuture {
-    count: u32
-}
-
-impl PollFuture {
-    pub fn new(count: u32) -> PollFuture {
-        PollFuture { count }
-    }
-
-    pub fn once() -> PollFuture {
-        PollFuture::new(1)
-    }
-}
-
-impl Future for PollFuture {
-    type Output = ();
-
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.count > 0 {
-            self.get_mut().count -= 1;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-        else {
-            Poll::Ready(())
-        }
-    }
-}
