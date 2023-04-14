@@ -25,7 +25,7 @@ impl RtcDataChannelBackendImpl {
 }
 
 impl RtcDataChannelBackend for RtcDataChannelBackendImpl {
-    fn connect<'a>(config: &'a RtcConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> Pin<Box<dyn 'a + Future<Output = Result<Box<[RtcDataChannel]>, RtcPeerConnectionError>>>> {
+    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> Pin<Box<dyn 'a + Future<Output = Result<Box<[RtcDataChannel]>, RtcPeerConnectionError>>>> {
         Box::pin(RtcPeerConnector::connect(config, negotiator, channels))
     }
 
@@ -57,6 +57,12 @@ impl RtcDataChannelEventHandlers {
 
         (Self { open_count, ready_state: ready_state.clone(), receive_waker: receive_waker.clone(), sender }, RtcDataChannelHandlerState { ready_state, receive_waker, receiver })
     }
+
+    fn wake_listener(&mut self) {
+        if let Some(waker) = &*self.receive_waker.load() {
+            waker.wake_by_ref();
+        }
+    }
 }
 
 impl datachannel::DataChannelHandler for RtcDataChannelEventHandlers {
@@ -67,18 +73,18 @@ impl datachannel::DataChannelHandler for RtcDataChannelEventHandlers {
     fn on_closed(&mut self) {
         drop(self.sender.send(Err(RtcDataChannelError::Receive("The channel was closed.".to_string()))));
         self.ready_state.store(RtcDataChannelReadyState::Closed as u8, Ordering::Release);
+        self.wake_listener();
     }
 
     fn on_error(&mut self, err: &str) {
         drop(self.sender.send(Err(RtcDataChannelError::Receive(format!("The channel encountered an error: {}", err)))));
         self.ready_state.store(RtcDataChannelReadyState::Closed as u8, Ordering::Release);
+        self.wake_listener();
     }
 
     fn on_message(&mut self, msg: &[u8]) {
         drop(self.sender.send(Ok(msg.to_vec().into_boxed_slice())));
-        if let Some(waker) = &*self.receive_waker.load() {
-            waker.wake_by_ref();
-        }
+        self.wake_listener();
     }
 
     fn on_buffered_amount_low(&mut self) {}
@@ -88,20 +94,19 @@ impl datachannel::DataChannelHandler for RtcDataChannelEventHandlers {
 
 struct RtcPeerConnector<'a, N: RtcNegotiationHandler> {
     channel_configurations: &'a [RtcDataChannelConfiguration<'a>],
-    configuration: &'a RtcConfiguration<'a>,
     handle: Pin<Box<datachannel::RtcPeerConnection<RtcPeerConnectionEventHandlers>>>,
     negotiator: N,
     negotiation_receive: Receiver<RtcNegotiationNotification>
 }
 
 impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
-    pub async fn connect(configuration: &'a RtcConfiguration<'a>, negotiator: N, channel_configurations: &'a [RtcDataChannelConfiguration<'a>]) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
+    pub async fn connect(configuration: &'a IceConfiguration<'a>, negotiator: N, channel_configurations: &'a [RtcDataChannelConfiguration<'a>]) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
         let (negotiation_send, negotiation_receive) = channel();
 
-        let handle = Box::into_pin(datachannel::RtcPeerConnection::new(&(&configuration.ice_configuation).into(), RtcPeerConnectionEventHandlers::new(negotiation_send))
+        let handle = Box::into_pin(datachannel::RtcPeerConnection::new(&configuration.into(), RtcPeerConnectionEventHandlers::new(negotiation_send))
             .map_err(|x| RtcPeerConnectionError::Creation(x.to_string()))?);
 
-        Self { channel_configurations, configuration, handle, negotiator, negotiation_receive }.accept_connections().await
+        Self { channel_configurations, handle, negotiator, negotiation_receive }.accept_connections().await
     }
 
     async fn accept_connections(mut self) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
@@ -113,16 +118,17 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
     async fn negotiate_connection(&mut self, channels: &RtcDataChannelList) -> Result<(), RtcPeerConnectionError> {
         let mut candidate_buffer = Vec::new();
 
+        let mut local_description = None;
         while channels.open_count.load(Ordering::Acquire) < channels.handle_states.len() {
             if let Ok(n) = self.negotiation_receive.try_recv() {
                 match n {
-                    RtcNegotiationNotification::SendMessage(m) => self.negotiator.send(m).await?,
+                    RtcNegotiationNotification::SendMessage(m) => self.send_message_update_description(m, &mut local_description).await?,
                     RtcNegotiationNotification::Failed(m) => return Err(m)
                 }
             }
             else {
                 for m in self.negotiator.receive().await? {
-                    self.receive_negotiation_message(m, &mut candidate_buffer).await?;
+                    self.receive_negotiation_message(m, &mut candidate_buffer, &local_description).await?;
                 }
             }
 
@@ -155,7 +161,20 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
         Ok(RtcDataChannelList { handle_states, open_count })
     }
 
-    async fn receive_negotiation_message(&mut self, message: RtcNegotiationMessage, candidate_buffer: &mut Vec<RtcIceCandidate>) -> Result<(), RtcPeerConnectionError> {
+    async fn send_message_update_description(&mut self, message: RtcNegotiationMessage, local_description: &mut Option<RtcSessionDescription>) -> Result<(), RtcPeerConnectionError> {
+        if let RtcNegotiationMessage::RemoteSessionDescription(desc) = &message {
+            if desc.sdp_type == "offer" && self.handle.remote_description().map(|x| x.sdp_type == datachannel::SdpType::Offer).unwrap_or(false) {
+                return Ok(());
+            }
+            if local_description.is_none() {
+                *local_description = Some(desc.clone());
+            }
+        }
+
+        self.negotiator.send(message).await
+    }
+
+    async fn receive_negotiation_message(&mut self, message: RtcNegotiationMessage, candidate_buffer: &mut Vec<RtcIceCandidate>, local_description: &Option<RtcSessionDescription>) -> Result<(), RtcPeerConnectionError> {
         match message {
             RtcNegotiationMessage::RemoteCandidate(c) => {
                 if self.has_remote_description() {
@@ -175,11 +194,11 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
                             "offer" => datachannel::SdpType::Offer,
                             "pranswer" => datachannel::SdpType::Pranswer,
                             "rollback" => datachannel::SdpType::Rollback,
-                            _ => datachannel::SdpType::Offer
+                            _ => Err(RtcPeerConnectionError::Negotiation("Unexpected SDP type".to_string()))?
                         }
                     };
                     
-                    if self.configuration.mode != RtcCandidateMode::Host || ci.sdp_type != datachannel::SdpType::Offer {
+                    if ci.sdp_type != datachannel::SdpType::Offer || local_description.as_ref().map(|x| x.sdp < c.sdp).unwrap_or(true) {
                         self.handle.set_remote_description(&ci).map_err(|x| RtcPeerConnectionError::Negotiation(x.to_string()))?;
 
                         for cand in candidate_buffer.drain(..) {

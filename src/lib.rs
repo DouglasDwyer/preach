@@ -36,7 +36,7 @@ impl RtcDataChannel {
 
     /// Connects to a remote peer with the provided configuration and negotiator. If successful,
     /// returns the set of channels corresponding to the provided channel configurations.
-    pub async fn connect(config: &RtcConfiguration<'_>, negotiator: impl RtcNegotiationHandler, channels: &[RtcDataChannelConfiguration<'_>]) -> Result<Box<[Self]>, RtcPeerConnectionError> {
+    pub async fn connect(config: &IceConfiguration<'_>, negotiator: impl RtcNegotiationHandler, channels: &[RtcDataChannelConfiguration<'_>]) -> Result<Box<[Self]>, RtcPeerConnectionError> {
         backend::RtcDataChannelBackendImpl::connect(config, negotiator, channels).await
     }
 
@@ -172,15 +172,6 @@ pub struct RtcSessionDescription {
     pub sdp_type: String,
 }
 
-/// Describes how this peer should establish a connection.
-#[derive(PartialEq, Clone, Debug)]
-pub struct RtcConfiguration<'a> {
-    /// Determines how ICE should be used to connect to the remote host.
-    pub ice_configuation: IceConfiguration<'a>,
-    /// The role that this candidate should play in connection establishment.
-    pub mode: RtcCandidateMode
-}
-
 /// Describes the set of ICE servers and protocols that should be employed
 /// during connection establishment.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -294,7 +285,7 @@ impl<'a> Future for RtcDataChannelReceiveFuture<'a> {
 /// Provides the backing functionality for a data channel.
 trait RtcDataChannelBackend {
     /// Attempts to connect to a remote peer with the provided configuration, returning the newly-created set of channels for the peer.
-    fn connect<'a>(config: &'a RtcConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> Pin<Box<dyn 'a + Future<Output = Result<Box<[RtcDataChannel]>, RtcPeerConnectionError>>>>;
+    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> Pin<Box<dyn 'a + Future<Output = Result<Box<[RtcDataChannel]>, RtcPeerConnectionError>>>>;
     /// Determines the channel's current connection state.
     fn ready_state(&self) -> RtcDataChannelReadyState;
     /// Sends a message to the remote host.
@@ -338,7 +329,7 @@ mod test {
             ice_transport_policy: RtcIceTransportPolicy::All
         };
 
-        RtcDataChannel::connect(&RtcConfiguration {ice_configuation, mode }, handler,
+        RtcDataChannel::connect(&ice_configuation, handler,
             &[RtcDataChannelConfiguration { label: "chan", ..Default::default() }]
         ).await
     }
