@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DouglasDwyer/preach"
-readme = "README.md"
+#readme = "README.md"
 description = """
 Platform independent data channels for WebRTC/Rust.
 """

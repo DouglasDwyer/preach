@@ -112,6 +112,7 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
 
     async fn negotiate_connection(&mut self, channels: &RtcDataChannelList) -> Result<(), RtcPeerConnectionError> {
         let mut candidate_buffer = Vec::new();
+
         while channels.open_count.load(Ordering::Acquire) < channels.handle_states.len() {
             if let Ok(n) = self.negotiation_receive.try_recv() {
                 match n {
