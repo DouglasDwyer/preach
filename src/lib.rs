@@ -102,17 +102,6 @@ pub trait RtcNegotiationHandler {
     fn receive(&mut self) -> Pin<Box<dyn '_ + Future<Output = Result<Vec<RtcNegotiationMessage>, RtcPeerConnectionError>>>>;
 }
 
-/// Denotes which role a peer should play in connection establishment. One
-/// peer must be the `Host`, and the other must be the `Client`, for a
-/// connection to be created.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RtcCandidateMode {
-    /// This peer will host the session, and create the connection offer.
-    Host,
-    /// This peer will receive the connection offer and generate an answer.
-    Client
-}
-
 /// Describes an error that occurred while attempting to establish a peer connection.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum RtcPeerConnectionError {
@@ -294,6 +283,35 @@ trait RtcDataChannelBackend {
     fn receive_waker(&mut self) -> Arc<ArcSwapOption<Waker>>;
 }
 
+struct PollFuture {
+    count: u32
+}
+
+impl PollFuture {
+    pub fn new(count: u32) -> PollFuture {
+        PollFuture { count }
+    }
+
+    pub fn once() -> PollFuture {
+        PollFuture::new(1)
+    }
+}
+
+impl Future for PollFuture {
+    type Output = ();
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.count > 0 {
+            self.get_mut().count -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+        else {
+            Poll::Ready(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -323,7 +341,7 @@ mod test {
         }
     }
 
-    async fn create_channels(handler: ChannelNegotiationHandler, mode: RtcCandidateMode) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
+    async fn create_channels(handler: ChannelNegotiationHandler) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
         let ice_configuation = IceConfiguration {
             ice_servers: &[RtcIceServer { urls: &[ "stun:stun.l.google.com:19302" ], ..Default::default() }],
             ice_transport_policy: RtcIceTransportPolicy::All
@@ -343,12 +361,12 @@ mod test {
         let msg = b"test msg";
 
         local.spawn_local(async move {
-            let chans = create_channels(a, RtcCandidateMode::Client).await;
+            let chans = create_channels(a).await;
             chans.expect("An error occurred during channel creation.")[0].send(&msg[..]).expect("An error occurred during message sending.");
         });
 
         local.run_until(async move {
-            let chans = create_channels(b, RtcCandidateMode::Host).await;
+            let chans = create_channels(b).await;
             let res = chans.expect("An error occurred during channel creation.")[0].receive_async().await.expect("An error occurred during message sending.");
             assert!(&res[..] == &msg[..]);
         }).await;
