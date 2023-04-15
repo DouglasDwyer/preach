@@ -5,6 +5,7 @@ use wasm_bindgen::*;
 use wasm_bindgen::closure::*;
 use wasm_bindgen_futures::*;
 
+/// Provides a browser-backed implementation of a datachannel based upon the `web_sys` crate.
 pub struct RtcDataChannelBackendImpl {
     _event_handlers: RtcDataChannelEventHandlers,
     handle: web_sys::RtcDataChannel,
@@ -13,7 +14,9 @@ pub struct RtcDataChannelBackendImpl {
 }
 
 impl RtcDataChannelBackendImpl {
-    fn new(handle: web_sys::RtcDataChannel, open_count: Arc<AtomicUsize>) -> (Self, Receiver<Result<Box<[u8]>, RtcDataChannelError>>) {
+    /// Creates a new data channel and receiver from the given handle. Increments the provided open count when the channel opens.
+    fn new(handle: web_sys::RtcDataChannel, open_count: Arc<AtomicUsize>) -> (Self, RtcDataChannelMessageReceiver) {
+        handle.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
         let (event_handlers, state) = RtcDataChannelEventHandlers::new(handle.clone(), open_count);
 
         (Self {
@@ -26,7 +29,7 @@ impl RtcDataChannelBackendImpl {
 }
 
 impl RtcDataChannelBackend for RtcDataChannelBackendImpl {
-    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> Pin<Box<dyn 'a + Future<Output = Result<Box<[RtcDataChannel]>, RtcPeerConnectionError>>>> {
+    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a> {
         Box::pin(RtcPeerConnector::connect(config, negotiator, channels))
     }
 
@@ -39,11 +42,11 @@ impl RtcDataChannelBackend for RtcDataChannelBackendImpl {
         {
             let buffer = ArrayBuffer::new(message.len().try_into().expect("Message was too large to be sent."));
             Uint8Array::new(&buffer).copy_from(message);
-            self.handle.send_with_array_buffer(&buffer).map_err(|x| RtcDataChannelError::Send(format!("{:?}", x)))
+            self.handle.send_with_array_buffer(&buffer).map_err(|x| RtcDataChannelError::Send(format!("{x:?}")))
         }
         #[cfg(not(target_feature = "atomics"))]
         {
-            self.handle.send_with_u8_array(message).map_err(|x| RtcDataChannelError::Send(format!("{:?}", x)))
+            self.handle.send_with_u8_array(message).map_err(|x| RtcDataChannelError::Send(format!("{x:?}")))
         }
     }
 
@@ -52,13 +55,7 @@ impl RtcDataChannelBackend for RtcDataChannelBackendImpl {
     }
 }
 
-#[derive(Debug)]
-struct RtcDataChannelHandlerState {
-    pub ready_state: Arc<AtomicU8>,
-    pub receive_waker: Arc<ArcSwapOption<Waker>>,
-    pub receiver: Receiver<Result<Box<[u8]>, RtcDataChannelError>>
-}
-
+/// Responds to events that occur on a data channel.
 struct RtcDataChannelEventHandlers {
     handle: web_sys::RtcDataChannel,
     _on_close: Closure<dyn FnMut(JsValue)>,
@@ -67,24 +64,30 @@ struct RtcDataChannelEventHandlers {
 }
 
 impl RtcDataChannelEventHandlers {
+    /// Creates a new set of event handlers for the given handle. The provided count is updated upon channel open.
     pub fn new(handle: web_sys::RtcDataChannel, open_count: Arc<AtomicUsize>) -> (Self, RtcDataChannelHandlerState) {
-        let ready_state = Arc::<AtomicU8>::default();
+        let ready_state = Arc::new(AtomicU8::new(RtcDataChannelReadyState::Open as u8));
         let receive_waker = Arc::<ArcSwapOption<Waker>>::default();
         let (sender, receiver) = channel();
 
         let sender_ref = sender.clone();
         let waker_ref = receive_waker.clone();
+        let ready_state_ref = ready_state.clone();
         let on_close = Closure::wrap(Box::new(move |ev: JsValue| { 
-            drop(sender_ref.send(Err(RtcDataChannelError::Receive(format!("{:?}", ev)))));
+            ready_state_ref.store(RtcDataChannelReadyState::Closed as u8, Ordering::Release);
+            drop(sender_ref.send(Err(RtcDataChannelError::Receive(format!("{ev:?}")))));
             Self::wake_listener(&waker_ref);
         }) as Box<dyn FnMut(JsValue)>);
         
-        let sender_ref = sender.clone();
         let waker_ref = receive_waker.clone();
+        let ready_state_ref = ready_state.clone();
         let on_message = Closure::wrap(Box::new(move |ev: web_sys::MessageEvent| {
-            drop(sender_ref.send(match ev.data().dyn_into::<ArrayBuffer>() {
+            drop(sender.send(match ev.data().dyn_into::<ArrayBuffer>() {
                 Ok(data) => Ok(Uint8Array::new(&data).to_vec().into_boxed_slice()),
-                Err(data) => Err(RtcDataChannelError::Receive(format!("{:?}", data))),
+                Err(data) => {
+                    ready_state_ref.store(RtcDataChannelReadyState::Closed as u8, Ordering::Release);
+                    Err(RtcDataChannelError::Receive(format!("{data:?}")))
+                },
             }));
             Self::wake_listener(&waker_ref);
         }) as Box<dyn FnMut(web_sys::MessageEvent)>);
@@ -115,16 +118,35 @@ impl Drop for RtcDataChannelEventHandlers {
     }
 }
 
+/// Stores the state necessary to interact with a data channel handle.
+#[derive(Debug)]
+struct RtcDataChannelHandlerState {
+    /// The current ready state of the channel.
+    pub ready_state: Arc<AtomicU8>,
+    /// A waker that receives a notification whenever something new happens on the channel.
+    pub receive_waker: Arc<ArcSwapOption<Waker>>,
+    /// The receiver to read in order to obtain new messages from the remote peer.
+    pub receiver: RtcDataChannelMessageReceiver
+}
+
+/// Stores a list of data channels that are being opened
 struct RtcDataChannelList {
+    /// A list of channels, ordered by ID.
     pub channels: Vec<RtcDataChannel>,
+    /// The total number of channels that have successfully opened so far.
     pub open_count: Arc<AtomicUsize>
 }
 
+/// Notifies the local connector about an event during connection establishment.
+#[derive(Clone, Debug)]
 enum RtcNegotiationNotification {
+    /// A message should be sent to the remote peer.
     SendMessage(RtcNegotiationMessage),
+    /// The connection failed with an error.
     Failed(RtcPeerConnectionError)
 }
 
+/// Manages the establishment of a connection with a remote peer.
 struct RtcPeerConnector<'a, N: RtcNegotiationHandler> {
     channel_configurations: &'a [RtcDataChannelConfiguration<'a>],
     _event_handlers: RtcPeerConnectionEventHandlers,
@@ -134,14 +156,16 @@ struct RtcPeerConnector<'a, N: RtcNegotiationHandler> {
 }
 
 impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
+    /// Creates a new connector for the given configuration, negotiator, and channels.
     pub async fn connect(configuration: &'a IceConfiguration<'a>, negotiator: N, channel_configurations: &'a [RtcDataChannelConfiguration<'a>]) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
         let (negotiation_send, negotiation_receive) = channel();
-        let handle = web_sys::RtcPeerConnection::new_with_configuration(&configuration.into()).map_err(|x| RtcPeerConnectionError::Creation(format!("{:?}", x)))?;
+        let handle = web_sys::RtcPeerConnection::new_with_configuration(&configuration.into()).map_err(|x| RtcPeerConnectionError::Creation(format!("{x:?}")))?;
         let event_handlers = RtcPeerConnectionEventHandlers::new(handle.clone(), negotiation_send);
 
         Self { channel_configurations, _event_handlers: event_handlers, handle, negotiator, negotiation_receive }.accept_connections().await
     }
 
+    /// Performs ICE with the remote peer and attempts to create a set of data channels.
     async fn accept_connections(&mut self) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
         let channels = self.create_channels()?;
         let local_description = self.create_offer().await?;
@@ -150,13 +174,14 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
         Ok(channels.channels.into_boxed_slice())
     }
 
+    /// Creates the set of data channels described by the current configuration.
     fn create_channels(&mut self) -> Result<RtcDataChannelList, RtcPeerConnectionError> {
         let mut channels = Vec::new();
         let open_count = Arc::<AtomicUsize>::default();
 
         for config in self.channel_configurations {
             let (handler, receiver) = RtcDataChannelBackendImpl::new(
-                self.handle.create_data_channel_with_data_channel_dict(config.label, &web_sys::RtcDataChannelInit::from(config).id(channels.len() as u16)), open_count.clone());
+                self.handle.create_data_channel_with_data_channel_dict(config.label, web_sys::RtcDataChannelInit::from(config).id(channels.len() as u16)), open_count.clone());
 
             channels.push(RtcDataChannel::new(handler, config.label.to_string(), channels.len() as u16, receiver));
         }
@@ -164,10 +189,10 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
         Ok(RtcDataChannelList { channels, open_count })
     }
 
+    /// Creates a connection offer to send to the remote host.
     async fn create_offer(&mut self) -> Result<RtcSessionDescription, RtcPeerConnectionError> {
         let offer = JsFuture::from(self.handle.create_offer_with_rtc_offer_options(&web_sys::RtcOfferOptions::new())).await
-            .map_err(|x| RtcPeerConnectionError::Negotiation(format!("{:?}", x)))?.unchecked_into::<web_sys::RtcSessionDescription>();
-        JsFuture::from(self.handle.set_local_description(&offer.clone().unchecked_into())).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{:?}", x)))?;
+            .map_err(|x| RtcPeerConnectionError::Negotiation(format!("{x:?}")))?.unchecked_into::<web_sys::RtcSessionDescription>();
 
         Ok(RtcSessionDescription {
             sdp_type: match offer.type_() {
@@ -181,6 +206,7 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
         })
     }
 
+    /// Exchanges messages with the remote peer until an error occurs or a connection is established.
     async fn negotiate(&mut self, channels: &RtcDataChannelList, local_description: &RtcSessionDescription) -> Result<(), RtcPeerConnectionError> {
         let mut candidate_buffer = Vec::new();
 
@@ -193,7 +219,7 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
             }
             else {
                 for m in self.negotiator.receive().await? {
-                    self.receive_negotiation_message(m, &mut candidate_buffer, &local_description).await?;
+                    self.receive_negotiation_message(m, &mut candidate_buffer, local_description).await?;
                 }
             }
 
@@ -203,6 +229,7 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
         Ok(())
     }
 
+    /// Interprets a negotiation message from the remote peer and handles the result.
     async fn receive_negotiation_message(&mut self, message: RtcNegotiationMessage, candidate_buffer: &mut Vec<RtcIceCandidate>, local_description: &RtcSessionDescription) -> Result<(), RtcPeerConnectionError> {
         match message {
             RtcNegotiationMessage::RemoteCandidate(c) => {
@@ -222,6 +249,7 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
                         }
                     }
                     else {
+                        self.set_local_description(local_description).await?;
                         self.handle_remote_answer(c, candidate_buffer).await?;
                     }
                 }
@@ -231,20 +259,21 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
         }
     }
 
+    /// Handles the receipt of a remote offer, creating a local answer and adding any known ICE candidates to the connection.
     async fn handle_remote_offer(&mut self, c: RtcSessionDescription, candidate_buffer: &mut Vec<RtcIceCandidate>) -> Result<(), RtcPeerConnectionError> {
         let mut description = web_sys::RtcSessionDescriptionInit::new(web_sys::RtcSdpType::Offer);
         description.sdp(&c.sdp);
-        JsFuture::from(self.handle.set_remote_description(&description)).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{:?}", x)))?;
+        JsFuture::from(self.handle.set_remote_description(&description)).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{x:?}")))?;
 
         for cand in candidate_buffer.drain(..) {
             self.add_remote_candidate(cand).await?;
         }
 
-        let answer = JsFuture::from(self.handle.create_answer()).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{:?}", x)))?;
+        let answer = JsFuture::from(self.handle.create_answer()).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{x:?}")))?;
         let answer_sdp = Reflect::get(&answer, &JsValue::from_str("sdp")).unwrap().as_string().unwrap();
         let mut answer_obj = web_sys::RtcSessionDescriptionInit::new(web_sys::RtcSdpType::Answer);
         answer_obj.sdp(&answer_sdp);
-        JsFuture::from(self.handle.set_local_description(&answer_obj)).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{:?}", x)))?;
+        JsFuture::from(self.handle.set_local_description(&answer_obj)).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{x:?}")))?;
         self.negotiator.send(RtcNegotiationMessage::RemoteSessionDescription(RtcSessionDescription {
             sdp_type: "answer".into(),
             sdp: answer_sdp,
@@ -253,10 +282,11 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
         Ok(())
     }
 
+    /// Handles the receipt of a remote answer, setting the remote description and adding any known ICE candidates to the connection.
     async fn handle_remote_answer(&mut self, c: RtcSessionDescription, candidate_buffer: &mut Vec<RtcIceCandidate>) -> Result<(), RtcPeerConnectionError> {
         let mut description = web_sys::RtcSessionDescriptionInit::new(web_sys::RtcSdpType::from_js_value(&JsValue::from_str(&c.sdp_type)).unwrap());
         description.sdp(&c.sdp);
-        JsFuture::from(self.handle.set_remote_description(&description)).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{:?}", x)))?;
+        JsFuture::from(self.handle.set_remote_description(&description)).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{x:?}")))?;
 
         for cand in candidate_buffer.drain(..) {
             self.add_remote_candidate(cand).await?;
@@ -265,19 +295,30 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
         Ok(())
     }
 
+    /// Sets the local description for an offer.
+    async fn set_local_description(&mut self, local_description: &RtcSessionDescription) -> Result<(), RtcPeerConnectionError> {
+        let mut description = web_sys::RtcSessionDescriptionInit::new(web_sys::RtcSdpType::Offer);
+        description.sdp(&local_description.sdp);
+        JsFuture::from(self.handle.set_local_description(&description.clone().unchecked_into())).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{x:?}")))?;
+        Ok(())
+    }
+
+    /// Determines whether this connector has a remote description yet.
     fn has_remote_description(&self) -> bool {
         self.handle.remote_description().is_some()
     }
 
+    /// Adds a remote ICE candidate to the peer connection.
     async fn add_remote_candidate(&mut self, c: RtcIceCandidate) -> Result<(), RtcPeerConnectionError> {
         let mut cand = web_sys::RtcIceCandidateInit::new(&c.candidate);
         cand.sdp_mid(Some(&c.sdp_mid));
-        JsFuture::from(self.handle.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&cand))).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{:?}", x)))?;
+        JsFuture::from(self.handle.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&cand))).await.map_err(|x| RtcPeerConnectionError::Negotiation(format!("{x:?}")))?;
 
         Ok(())
     }
 }
 
+/// Responds to events that occur on a new peer connection.
 struct RtcPeerConnectionEventHandlers {
     handle: web_sys::RtcPeerConnection,
     _on_ice_candidate: Closure<dyn FnMut(web_sys::RtcPeerConnectionIceEvent)>,
@@ -285,6 +326,7 @@ struct RtcPeerConnectionEventHandlers {
 }
 
 impl RtcPeerConnectionEventHandlers {
+    /// Creates a new set of event handlers that send messages to the provided sink.
     pub fn new(handle: web_sys::RtcPeerConnection, negotiation_send: Sender<RtcNegotiationNotification>) -> Self {
         let ns = negotiation_send.clone();
         let _on_ice_candidate = Closure::wrap(Box::new(move |ev: web_sys::RtcPeerConnectionIceEvent| {
@@ -308,11 +350,10 @@ impl RtcPeerConnectionEventHandlers {
         handle.set_onicecandidate(Some(_on_ice_candidate.as_ref().unchecked_ref()));
 
         let han = handle.clone();
-        let ns = negotiation_send.clone();
         let _on_ice_connection_state_change = Closure::wrap(Box::new(move |_: JsValue| {
             let evs = Reflect::get(&han, &JsString::from("connectionState")).map(|x| x.as_string().unwrap_or("".to_string())).unwrap_or("".to_string());
             if evs.as_str() == "failed" {
-                drop(ns.send(RtcNegotiationNotification::Failed(RtcPeerConnectionError::IceNegotiationFailure("ICE protocol could not find a valid candidate pair.".to_string()))));
+                drop(negotiation_send.send(RtcNegotiationNotification::Failed(RtcPeerConnectionError::IceNegotiationFailure("ICE protocol could not find a valid candidate pair.".to_string()))));
             }
         }) as Box<dyn FnMut(JsValue)>);
         Reflect::set(&handle, &JsString::from("onconnectionstatechange"), _on_ice_connection_state_change.as_ref().unchecked_ref()).unwrap();

@@ -1,0 +1,50 @@
+# preach
+### Platform independent data channels
+
+[![Crates.io](https://img.shields.io/crates/v/preach.svg)](https://crates.io/crates/preach)
+[![Docs.rs](https://docs.rs/preach/badge.svg)](https://docs.rs/preach)
+
+Preach provides an abstraction for WebRTC data channels that runs on both native and web platforms. Preach manages the exchange of session descriptions and ICE candidates, making channel creation straightforward. Further, Preach offers a simple synchronous and asynchronous interface for exchanging messages, making it well-suited for a variety of purposes.
+
+To create a WebRTC connection, one must first exchange information with the remote peer through a signaling server. Because signaling servers vary with use case, Preach does not provide a signaling server implementation. However, Preach does automatically dictate the information that should be sent to the signaling server.
+
+### Usage
+
+For a complete example, see [the tests](src/tests.rs).
+
+To use Preach, a signaling server implementation must be supplied. This is accomplished by implementing the `RtcNegotiationHandler` trait:
+
+```rustc
+/// Negotiates a connection with the remote peer during the initial connection process,
+/// exchanging messages with the signaling server. 
+pub trait RtcNegotiationHandler {
+    /// Sends a negotiation message to the remote peer through a signaling implementation.
+    fn send(&mut self, message: RtcNegotiationMessage) -> Pin<Box<dyn '_ + Future<Output = Result<(), RtcPeerConnectionError>>>>;
+    /// Checks the signaling server for new negotiation messages from the remote peer.
+    fn receive(&mut self) -> Pin<Box<dyn '_ + Future<Output = Result<Vec<RtcNegotiationMessage>, RtcPeerConnectionError>>>>;
+}
+```
+
+This trait should be implemented so that any messages sent from one peer are received by the other, through the use of a signaling server. The server may otherwise function however the end user desires - for example, it could be implemented as a REST API.
+
+Once a signaling mechanism is provided, creating a new set of channels is easy:
+
+```rustc
+let ice_configuation = IceConfiguration {
+    ice_servers: &[RtcIceServer { urls: &[ "stun:stun.l.google.com:19302" ], ..Default::default() }],
+    ice_transport_policy: RtcIceTransportPolicy::All
+};
+
+// Boths peers must use the same set of RtcDataChannelConfigurations for a connection to be created.
+let channel = RtcDataChannel::connect(&ice_configuation, handler,
+    &[RtcDataChannelConfiguration { label: "chan", ..Default::default() }]
+).await.expect("An error occured during channel creation.")[0];
+
+let msg = b"test msg";
+
+// Send messages.
+channel.send(&msg[..]).expect("Could not send message.");
+
+// Receive messages.
+assert_eq!(&msg[..], &channel.receive_async().await.expect("An error occurred on the channel.")[..]);
+```

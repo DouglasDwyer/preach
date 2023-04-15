@@ -1,5 +1,56 @@
+//! ### Platform independent data channels
+//! 
+//! Preach provides an abstraction for WebRTC data channels that runs on both native and web platforms. Preach manages the exchange of session descriptions and ICE candidates, making channel creation straightforward. Further, Preach offers a simple synchronous and asynchronous interface for exchanging messages, making it well-suited for a variety of purposes.
+//! 
+//! To create a WebRTC connection, one must first exchange information with the remote peer through a signaling server. Because signaling servers vary with use case, Preach does not provide a signaling server implementation. However, Preach does automatically dictate the information that should be sent to the signaling server.
+//! 
+//! ### Usage
+//! 
+//! For a complete example, see [the tests](src/tests.rs).
+//! 
+//! To use Preach, a signaling server implementation must be supplied. This is accomplished by implementing the `RtcNegotiationHandler` trait:
+//! 
+//! ```
+//! /// Negotiates a connection with the remote peer during the initial connection process,
+//! /// exchanging messages with the signaling server. 
+//! pub trait RtcNegotiationHandler {
+//!     /// Sends a negotiation message to the remote peer through a signaling implementation.
+//!     fn send(&mut self, message: RtcNegotiationMessage) -> Pin<Box<dyn '_ + Future<Output = Result<(), RtcPeerConnectionError>>>>;
+//!     /// Checks the signaling server for new negotiation messages from the remote peer.
+//!     fn receive(&mut self) -> Pin<Box<dyn '_ + Future<Output = Result<Vec<RtcNegotiationMessage>, RtcPeerConnectionError>>>>;
+//! }
+//! ```
+//! 
+//! This trait should be implemented so that any messages sent from one peer are received by other, through the use of a signaling server. This server may otherwise function however the end user desires - for example, it could be implemented as a REST API.
+//! 
+//! Once a signaling mechanism is provided, creating a new set of channels is easy:
+//! 
+//! ```
+//! let ice_configuation = IceConfiguration {
+//!     ice_servers: &[RtcIceServer { urls: &[ "stun:stun.l.google.com:19302" ], ..Default::default() }],
+//!     ice_transport_policy: RtcIceTransportPolicy::All
+//! };
+//! 
+//! // Boths peers must use the same set of RtcDataChannelConfigurations for a connection to be created.
+//! let channel = RtcDataChannel::connect(&ice_configuation, handler,
+//!     &[RtcDataChannelConfiguration { label: "chan", ..Default::default() }]
+//! ).await.expect("An error occured during channel creation.")[0];
+//! 
+//! // Send messages
+//! channel.send(b"test msg").expect("Could not send message.");
+//! 
+//! // Receive messages
+//! assert_eq!(b"test_msg", &channel.receive_async().await.expect("An error occurred on the channel.")[..]);
+//! ```
+
+#[deny(warnings)]
+
 /// Provides the backing implementation for peer connections and channels.
 mod backend;
+
+#[cfg(test)]
+/// Provides tests and examples for using data channels.
+mod tests;
 
 use arc_swap::*;
 use serde::*;
@@ -19,12 +70,12 @@ pub struct RtcDataChannel {
     label: String,
     id: u16,
     previous_result: Result<(), RtcDataChannelError>,
-    received_messages: Receiver<Result<Box<[u8]>, RtcDataChannelError>>,
+    received_messages: RtcDataChannelMessageReceiver,
 }
 
 impl RtcDataChannel {
     /// Creates a new raw datachannel with the provided backing implementation, identifiers, and received message queue.
-    fn new(handle: backend::RtcDataChannelBackendImpl, label: String, id: u16, received_messages: Receiver<Result<Box<[u8]>, RtcDataChannelError>>) -> Self {
+    fn new(handle: backend::RtcDataChannelBackendImpl, label: String, id: u16, received_messages: RtcDataChannelMessageReceiver) -> Self {
         Self {
             handle,
             label,
@@ -271,10 +322,16 @@ impl<'a> Future for RtcDataChannelReceiveFuture<'a> {
     }
 }
 
+/// The receiver type that listens for new messages or errors from a data channel.
+type RtcDataChannelMessageReceiver = Receiver<Result<Box<[u8]>, RtcDataChannelError>>;
+
+/// The future type that provides an array of open data channels as its result.
+type RtcDataChannelConnectionFuture<'a> = Pin<Box<dyn 'a + Future<Output = Result<Box<[RtcDataChannel]>, RtcPeerConnectionError>>>>;
+
 /// Provides the backing functionality for a data channel.
 trait RtcDataChannelBackend {
     /// Attempts to connect to a remote peer with the provided configuration, returning the newly-created set of channels for the peer.
-    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> Pin<Box<dyn 'a + Future<Output = Result<Box<[RtcDataChannel]>, RtcPeerConnectionError>>>>;
+    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a>;
     /// Determines the channel's current connection state.
     fn ready_state(&self) -> RtcDataChannelReadyState;
     /// Sends a message to the remote host.
@@ -283,15 +340,18 @@ trait RtcDataChannelBackend {
     fn receive_waker(&mut self) -> Arc<ArcSwapOption<Waker>>;
 }
 
+/// A future that must be polled a certain number of times before it completes.
 struct PollFuture {
     count: u32
 }
 
 impl PollFuture {
+    /// Creates a new future that must be polled the provided number of times before completion.
     pub fn new(count: u32) -> PollFuture {
         PollFuture { count }
     }
 
+    /// Creates a future that returns pending once, and then completes.
     pub fn once() -> PollFuture {
         PollFuture::new(1)
     }
@@ -309,66 +369,5 @@ impl Future for PollFuture {
         else {
             Poll::Ready(())
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    struct ChannelNegotiationHandler {
-        sender: Sender<RtcNegotiationMessage>,
-        receiver: Receiver<RtcNegotiationMessage>
-    }
-
-    impl ChannelNegotiationHandler {
-        pub fn new_pair() -> (Self, Self) {
-            let (send_a, recv_b) = channel();
-            let (send_b, recv_a) = channel();
-
-            (Self { sender: send_a, receiver: recv_a }, Self { sender: send_b, receiver: recv_b })
-        }
-    }
-
-    impl RtcNegotiationHandler for ChannelNegotiationHandler {
-        fn send(&mut self, message: RtcNegotiationMessage) -> Pin<Box<dyn '_ + Future<Output = Result<(), RtcPeerConnectionError>>>> {
-            drop(self.sender.send(message));
-            Box::pin(async { Ok(()) })
-        }
-
-        fn receive(&mut self) -> Pin<Box<dyn '_ + Future<Output = Result<Vec<RtcNegotiationMessage>, RtcPeerConnectionError>>>> {
-            Box::pin(async { Ok(self.receiver.try_recv().ok().into_iter().collect::<Vec<_>>()) })
-        }
-    }
-
-    async fn create_channels(handler: ChannelNegotiationHandler) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
-        let ice_configuation = IceConfiguration {
-            ice_servers: &[RtcIceServer { urls: &[ "stun:stun.l.google.com:19302" ], ..Default::default() }],
-            ice_transport_policy: RtcIceTransportPolicy::All
-        };
-
-        RtcDataChannel::connect(&ice_configuation, handler,
-            &[RtcDataChannelConfiguration { label: "chan", ..Default::default() }]
-        ).await
-    }
-    
-    #[tokio::test]
-    async fn test_connect() {
-        let local = tokio::task::LocalSet::new();
-
-        let (a, b) = ChannelNegotiationHandler::new_pair();
-
-        let msg = b"test msg";
-
-        local.spawn_local(async move {
-            let chans = create_channels(a).await;
-            chans.expect("An error occurred during channel creation.")[0].send(&msg[..]).expect("An error occurred during message sending.");
-        });
-
-        local.run_until(async move {
-            let chans = create_channels(b).await;
-            let res = chans.expect("An error occurred during channel creation.")[0].receive_async().await.expect("An error occurred during message sending.");
-            assert!(&res[..] == &msg[..]);
-        }).await;
     }
 }
