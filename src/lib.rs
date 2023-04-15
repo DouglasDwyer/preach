@@ -31,8 +31,10 @@
 //!     ice_transport_policy: RtcIceTransportPolicy::All
 //! };
 //! 
+//! let negotiation_handler = ...; // Implementation of RtcNegotiationHandler
+//! 
 //! // Boths peers must use the same set of RtcDataChannelConfigurations for a connection to be created.
-//! let channel = RtcDataChannel::connect(&ice_configuation, handler,
+//! let channel = RtcDataChannel::connect(&ice_configuation, negotiation_handler,
 //!     &[RtcDataChannelConfiguration { label: "chan", ..Default::default() }]
 //! ).await.expect("An error occured during channel creation.")[0];
 //! 
