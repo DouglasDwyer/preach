@@ -8,7 +8,7 @@ Preach provides an abstraction for WebRTC data channels that runs on both native
 
 To create a WebRTC connection, one must first exchange information with the remote peer through a signaling server. Because signaling servers vary with use case, Preach does not provide a signaling server implementation. However, Preach does automatically dictate the information that should be sent to the signaling server.
 
-### Usage
+## Usage
 
 For a complete example, see [the tests](src/tests.rs).
 
@@ -50,3 +50,7 @@ channel.send(&msg[..]).expect("Could not send message.");
 // Receive messages.
 assert_eq!(&msg[..], &channel.receive_async().await.expect("An error occurred on the channel.")[..]);
 ```
+
+## Optional features
+
+**vendored** - Builds `libdatachannel` and `OpenSSL` statically on desktop platforms, bundling them into the build.
