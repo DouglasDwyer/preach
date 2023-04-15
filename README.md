@@ -14,7 +14,7 @@ For a complete example, see [the tests](src/tests.rs).
 
 To use Preach, a signaling server implementation must be supplied. This is accomplished by implementing the `RtcNegotiationHandler` trait:
 
-```rustc
+```rust
 /// Negotiates a connection with the remote peer during the initial connection process,
 /// exchanging messages with the signaling server. 
 pub trait RtcNegotiationHandler {
@@ -29,7 +29,7 @@ This trait should be implemented so that any messages sent from one peer are rec
 
 Once a signaling mechanism is provided, creating a new set of channels is easy:
 
-```rustc
+```rust
 let ice_configuation = IceConfiguration {
     ice_servers: &[RtcIceServer { urls: &[ "stun:stun.l.google.com:19302" ], ..Default::default() }],
     ice_transport_policy: RtcIceTransportPolicy::All

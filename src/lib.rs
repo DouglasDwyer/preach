@@ -10,7 +10,7 @@
 //! 
 //! To use Preach, a signaling server implementation must be supplied. This is accomplished by implementing the `RtcNegotiationHandler` trait:
 //! 
-//! ```
+//! ```rust
 //! /// Negotiates a connection with the remote peer during the initial connection process,
 //! /// exchanging messages with the signaling server. 
 //! pub trait RtcNegotiationHandler {
@@ -21,11 +21,11 @@
 //! }
 //! ```
 //! 
-//! This trait should be implemented so that any messages sent from one peer are received by other, through the use of a signaling server. This server may otherwise function however the end user desires - for example, it could be implemented as a REST API.
+//! This trait should be implemented so that any messages sent from one peer are received by the other, through the use of a signaling server. The server may otherwise function however the end user desires - for example, it could be implemented as a REST API.
 //! 
 //! Once a signaling mechanism is provided, creating a new set of channels is easy:
 //! 
-//! ```
+//! ```rust
 //! let ice_configuation = IceConfiguration {
 //!     ice_servers: &[RtcIceServer { urls: &[ "stun:stun.l.google.com:19302" ], ..Default::default() }],
 //!     ice_transport_policy: RtcIceTransportPolicy::All
@@ -36,11 +36,13 @@
 //!     &[RtcDataChannelConfiguration { label: "chan", ..Default::default() }]
 //! ).await.expect("An error occured during channel creation.")[0];
 //! 
-//! // Send messages
-//! channel.send(b"test msg").expect("Could not send message.");
+//! let msg = b"test msg";
 //! 
-//! // Receive messages
-//! assert_eq!(b"test_msg", &channel.receive_async().await.expect("An error occurred on the channel.")[..]);
+//! // Send messages.
+//! channel.send(&msg[..]).expect("Could not send message.");
+//! 
+//! // Receive messages.
+//! assert_eq!(&msg[..], &channel.receive_async().await.expect("An error occurred on the channel.")[..]);
 //! ```
 
 #[deny(warnings)]
