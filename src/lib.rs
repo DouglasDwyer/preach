@@ -152,6 +152,12 @@ impl RtcDataChannel {
     }
 }
 
+impl std::fmt::Debug for RtcDataChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RtcDataChannel").field("label", &self.label).field("id", &self.id).finish()
+    }
+}
+
 /// Negotiates a connection with the remote peer during the initial connection process,
 /// exchanging messages with the signaling server. 
 pub trait RtcNegotiationHandler {
