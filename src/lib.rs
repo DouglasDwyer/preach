@@ -160,7 +160,7 @@ impl std::fmt::Debug for RtcDataChannel {
 
 /// Negotiates a connection with the remote peer during the initial connection process,
 /// exchanging messages with the signaling server. 
-pub trait RtcNegotiationHandler {
+pub trait RtcNegotiationHandler: 'static + Send {
     /// Sends a negotiation message to the remote peer through a signaling implementation.
     fn send(&mut self, message: RtcNegotiationMessage) -> Pin<Box<dyn '_ + Future<Output = Result<(), RtcPeerConnectionError>>>>;
     /// Checks the signaling server for new negotiation messages from the remote peer.
@@ -193,8 +193,6 @@ pub enum RtcDataChannelError {
     /// Messages could not be received.
     #[error("An error occurred during message receiving: {0}")]
     Receive(String),
-    //#[error("An error occurred while writing to std::io::Write: {0}")]
-    //WriteError(std::io::Error)
 }
 
 /// Provides data about a potential connection route to a remote peer.
@@ -345,7 +343,7 @@ type RtcDataChannelConnectionFuture<'a> = Pin<Box<dyn 'a + Future<Output = Resul
 /// Provides the backing functionality for a data channel.
 trait RtcDataChannelBackend {
     /// Attempts to connect to a remote peer with the provided configuration, returning the newly-created set of channels for the peer.
-    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a>;
+    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a>;
     /// Determines the channel's current connection state.
     fn ready_state(&self) -> RtcDataChannelReadyState;
     /// Sends a message to the remote host.

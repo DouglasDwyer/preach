@@ -54,3 +54,7 @@ assert_eq!(&msg[..], &channel.receive_async().await.expect("An error occurred on
 ## Optional features
 
 **vendored** - Builds `libdatachannel` and `OpenSSL` statically on desktop platforms, bundling them into the build.
+**wasm_main_executor** - Allows for creating data channels within WASM web workers, and sharing them between threads.
+By default, restrictions on workers prevent them from instantiating and working with peer channels. This feature sidesteps
+said restrictions by deferring work to the main browser thread. When using this feature, `wasm_main_executor::initialize()`
+must be called before creating any data channels.

@@ -19,6 +19,7 @@ tokio = { version = "1.27.0", features = [ "macros", "rt" ] }
 
 [features]
 vendored = [ "datachannel/vendored" ]
+wasm_main_executor = [ "dep:wasm_main_executor" ]
 
 [lib]
 doctest = false
@@ -29,8 +30,10 @@ webrtc-sdp = "0.3.9"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3.57"
+send_wrapper = "0.6.0"
 wasm-bindgen = "0.2.76"
 wasm-bindgen-futures = "0.4.30"
+wasm_main_executor = { path = "../wasm_main_executor", optional = true }
 web-sys = { version = "0.3.24", features = [
     "MessageEvent",
     "RtcConfiguration",
@@ -49,5 +52,6 @@ web-sys = { version = "0.3.24", features = [
     "RtcSessionDescription",
     "RtcSessionDescriptionInit", 
     "RtcSdpType",
-    "RtcSignalingState"
+    "RtcSignalingState",
+    "Window"
 ] }

@@ -1,5 +1,7 @@
 use crate::*;
 use js_sys::*;
+use send_wrapper::*;
+use std::mem::*;
 use std::sync::atomic::*;
 use wasm_bindgen::*;
 use wasm_bindgen::closure::*;
@@ -7,8 +9,7 @@ use wasm_bindgen_futures::*;
 
 /// Provides a browser-backed implementation of a datachannel based upon the `web_sys` crate.
 pub struct RtcDataChannelBackendImpl {
-    _event_handlers: RtcDataChannelEventHandlers,
-    handle: web_sys::RtcDataChannel,
+    handle: Option<Arc<SendWrapper<RtcDataChannelHandle>>>,
     ready_state: Arc<AtomicU8>,
     receive_waker: Arc<ArcSwapOption<Waker>>
 }
@@ -20,17 +21,35 @@ impl RtcDataChannelBackendImpl {
         let (event_handlers, state) = RtcDataChannelEventHandlers::new(handle.clone(), open_count);
 
         (Self {
-            _event_handlers: event_handlers,
-            handle,
+            handle: Some(Arc::new(SendWrapper::new(RtcDataChannelHandle { event_handlers, handle }))),
             ready_state: state.ready_state,
             receive_waker: state.receive_waker
         }, state.receiver)
     }
+
+    fn handle(&self) -> &Arc<SendWrapper<RtcDataChannelHandle>> {
+        self.handle.as_ref().expect("Handle was already disposed.")
+    }
+
+    fn copy_send_with_handle(handle: &web_sys::RtcDataChannel, message: &[u8]) -> Result<(), RtcDataChannelError> {
+        let buffer = ArrayBuffer::new(message.len().try_into().expect("Message was too large to be sent."));
+        Uint8Array::new(&buffer).copy_from(message);
+        handle.send_with_array_buffer(&buffer).map_err(|x| RtcDataChannelError::Send(format!("{x:?}")))
+    }
+
+    fn is_main_thread() -> bool {
+        web_sys::window().is_some()
+    }
 }
 
 impl RtcDataChannelBackend for RtcDataChannelBackendImpl {
-    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a> {
-        Box::pin(RtcPeerConnector::connect(config, negotiator, channels))
+    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a> {
+        if Self::is_main_thread() {
+            Box::pin(RtcPeerConnector::connect(config, negotiator, channels))
+        }
+        else {
+            Box::pin(spawn(FnFuture(|| RtcPeerConnector::connect(config, negotiator, channels))))
+        }
     }
 
     fn ready_state(&self) -> RtcDataChannelReadyState {
@@ -38,21 +57,48 @@ impl RtcDataChannelBackend for RtcDataChannelBackendImpl {
     }
 
     fn send(&mut self, message: &[u8]) -> Result<(), RtcDataChannelError> {
-        #[cfg(target_feature = "atomics")]
-        {
-            let buffer = ArrayBuffer::new(message.len().try_into().expect("Message was too large to be sent."));
-            Uint8Array::new(&buffer).copy_from(message);
-            self.handle.send_with_array_buffer(&buffer).map_err(|x| RtcDataChannelError::Send(format!("{x:?}")))
-        }
         #[cfg(not(target_feature = "atomics"))]
         {
-            self.handle.send_with_u8_array(message).map_err(|x| RtcDataChannelError::Send(format!("{x:?}")))
+            let handle = self.handle();
+            if handle.valid() {
+                Self::copy_send_with_handle(&handle.handle, message)
+            }
+            else {
+                let message_ref = message.to_vec();
+                let handle_ref = handle.clone();
+                spawn(async move {
+                    if let Some((err, f)) = Self::copy_send_with_handle(&handle_ref.handle, &message_ref[..]).err()
+                        .and_then(|t| handle_ref.handle.onerror().map(|f| (t, f))) {
+                        drop(f.call1(&JsValue::NULL, &JsValue::from_str(&err.to_string())));
+                    }
+                });
+
+                Ok(())
+            }
         }
+        /*#[cfg(not(target_feature = "atomics"))]
+        {
+            self.handle().handle.send_with_u8_array(message).map_err(|x| RtcDataChannelError::Send(format!("{x:?}")))
+        }*/
     }
 
     fn receive_waker(&mut self) -> Arc<ArcSwapOption<Waker>> {
         self.receive_waker.clone()
     }
+}
+
+impl Drop for RtcDataChannelBackendImpl {
+    fn drop(&mut self) {
+        if !self.handle().valid() {
+            let handle = take(&mut self.handle).expect("Handle was already disposed.");
+            spawn(async move { drop(handle); });
+        }
+    }
+}
+
+struct RtcDataChannelHandle {
+    pub event_handlers: RtcDataChannelEventHandlers,
+    pub handle: web_sys::RtcDataChannel,
 }
 
 /// Responds to events that occur on a data channel.
@@ -93,7 +139,7 @@ impl RtcDataChannelEventHandlers {
         }) as Box<dyn FnMut(web_sys::MessageEvent)>);
 
         let on_open = Closure::wrap(Box::new(move |_: JsValue| { open_count.fetch_add(1, Ordering::AcqRel); }) as Box<dyn FnMut(JsValue)>);
-
+        
         handle.set_onclose(Some(on_close.as_ref().unchecked_ref()));
         handle.set_onerror(Some(on_close.as_ref().unchecked_ref()));
         handle.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
@@ -368,6 +414,31 @@ impl Drop for RtcPeerConnectionEventHandlers {
         self.handle.set_ondatachannel(None);
         Reflect::set(&self.handle, &JsString::from("onconnectionstatechange"), &JsValue::UNDEFINED).unwrap();
     }
+}
+
+struct FnFuture<F: Future, T: FnOnce() -> F>(T);
+
+impl<F: Future, T: FnOnce() -> F> IntoFuture for FnFuture<F, T> {
+    type Output = F::Output;
+    type IntoFuture = F;
+
+    fn into_future(self) -> Self::IntoFuture {
+        (self.0)()
+    }
+}
+
+#[cfg(feature = "wasm_main_executor")]
+/// Spawns a new task for the main thread executor, or panics if the executor
+/// feature is not enabled.
+pub fn spawn<F: 'static + IntoFuture + Send>(f: F) -> impl Future<Output = F::Output> + Send + Sync where F::Output: Send {
+    wasm_main_executor::spawn(f)
+}
+
+#[cfg(not(feature = "wasm_main_executor"))]
+/// Spawns a new task for the main thread executor, or panics if the executor
+/// feature is not enabled.
+pub fn spawn<F: 'static + IntoFuture + Send>(_: F) -> F::IntoFuture {
+    panic!("Attempted to create data channel on worker thread without enabling the wasm_main_executor feature.")
 }
 
 impl From<&IceConfiguration<'_>> for web_sys::RtcConfiguration {

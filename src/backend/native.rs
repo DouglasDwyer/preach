@@ -27,7 +27,7 @@ impl RtcDataChannelBackendImpl {
 }
 
 impl RtcDataChannelBackend for RtcDataChannelBackendImpl {
-    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl 'a + RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a> {
+    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a> {
         Box::pin(RtcPeerConnector::connect(config, negotiator, channels))
     }
 
@@ -96,6 +96,9 @@ impl datachannel::DataChannelHandler for RtcDataChannelEventHandlers {
 
     fn on_available(&mut self) {}
 }
+
+unsafe impl Send for RtcDataChannelBackendImpl {}
+unsafe impl Sync for RtcDataChannelBackendImpl {}
 
 /// Manages the establishment of a connection with a remote peer.
 struct RtcPeerConnector<'a, N: RtcNegotiationHandler> {
