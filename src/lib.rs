@@ -327,7 +327,11 @@ impl<'a> Future for RtcDataChannelReceiveFuture<'a> {
             Ok(Some(res)) => Poll::Ready(Ok(res)),
             Ok(None) => { 
                 self.0.handle.receive_waker().store(Some(Arc::new(cx.waker().clone())));
-                Poll::Pending
+                match self.0.receive() {
+                    Ok(Some(res)) => Poll::Ready(Ok(res)),
+                    Ok(None) => Poll::Pending,
+                    Err(err) => Poll::Ready(Err(err))
+                }
             },
             Err(err) => Poll::Ready(Err(err))
         }
