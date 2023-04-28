@@ -162,6 +162,8 @@ impl std::fmt::Debug for RtcDataChannel {
     }
 }
 
+unsafe impl Sync for RtcDataChannel {}
+
 /// Negotiates a connection with the remote peer during the initial connection process,
 /// exchanging messages with the signaling server. 
 pub trait RtcNegotiationHandler: 'static + Send {
