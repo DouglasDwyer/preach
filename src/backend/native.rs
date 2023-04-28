@@ -9,7 +9,8 @@ use std::task::*;
 /// Provides a native implementation of a data channel based upon the `datachannel` crate.
 pub struct RtcDataChannelBackendImpl {
     handle: Pin<Box<datachannel::RtcDataChannel<RtcDataChannelEventHandlers>>>,
-    _peer_connection: Arc<Pin<Box<datachannel::RtcPeerConnection<RtcPeerConnectionEventHandlers>>>>,
+    #[allow(dead_code)]
+    peer_connection: Arc<Pin<Box<datachannel::RtcPeerConnection<RtcPeerConnectionEventHandlers>>>>,
     ready_state: Arc<AtomicU8>,
     receive_waker: Arc<ArcSwapOption<Waker>>
 }
@@ -19,7 +20,7 @@ impl RtcDataChannelBackendImpl {
     fn new(handle: Pin<Box<datachannel::RtcDataChannel<RtcDataChannelEventHandlers>>>, peer_connection: Arc<Pin<Box<datachannel::RtcPeerConnection<RtcPeerConnectionEventHandlers>>>>, state: &RtcDataChannelHandlerState) -> Self {
         Self {
             handle,
-            _peer_connection: peer_connection,
+            peer_connection,
             ready_state: state.ready_state.clone(),
             receive_waker: state.receive_waker.clone()
         }
@@ -27,7 +28,7 @@ impl RtcDataChannelBackendImpl {
 }
 
 impl RtcDataChannelBackend for RtcDataChannelBackendImpl {
-    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a> {
+    fn connect<'a>(config: &'a IceConfiguration, negotiator: impl RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration]) -> RtcDataChannelConnectionFuture<'a> {
         Box::pin(RtcPeerConnector::connect(config, negotiator, channels))
     }
 
@@ -102,7 +103,7 @@ unsafe impl Sync for RtcDataChannelBackendImpl {}
 
 /// Manages the establishment of a connection with a remote peer.
 struct RtcPeerConnector<'a, N: RtcNegotiationHandler> {
-    channel_configurations: &'a [RtcDataChannelConfiguration<'a>],
+    channel_configurations: &'a [RtcDataChannelConfiguration],
     handle: Pin<Box<datachannel::RtcPeerConnection<RtcPeerConnectionEventHandlers>>>,
     negotiator: N,
     negotiation_receive: Receiver<RtcNegotiationNotification>
@@ -110,7 +111,7 @@ struct RtcPeerConnector<'a, N: RtcNegotiationHandler> {
 
 impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
     /// Creates a new connector for the given configuration, negotiator, and channels.
-    pub async fn connect(configuration: &'a IceConfiguration<'a>, negotiator: N, channel_configurations: &'a [RtcDataChannelConfiguration<'a>]) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
+    pub async fn connect(configuration: &'a IceConfiguration, negotiator: N, channel_configurations: &'a [RtcDataChannelConfiguration]) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
         let (negotiation_send, negotiation_receive) = channel();
 
         let handle = Box::into_pin(datachannel::RtcPeerConnection::new(&configuration.into(), RtcPeerConnectionEventHandlers::new(negotiation_send))
@@ -167,7 +168,7 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
         for config in self.channel_configurations {
             let (handler, state) = RtcDataChannelEventHandlers::new(open_count.clone());
 
-            handle_states.push((Box::into_pin(self.handle.create_data_channel_ex(config.label, handler,
+            handle_states.push((Box::into_pin(self.handle.create_data_channel_ex(&config.label, handler,
                 &datachannel::DataChannelInit::from(config).stream(handle_states.len() as u16))
                 .map_err(|x| RtcPeerConnectionError::Creation(x.to_string()))?), state));
         }
@@ -333,14 +334,14 @@ impl From<RtcIceCandidate> for datachannel::IceCandidate {
     }
 }
 
-impl From<&IceConfiguration<'_>> for datachannel::RtcConfig {
-    fn from(x: &IceConfiguration<'_>) -> Self {
+impl From<&IceConfiguration> for datachannel::RtcConfig {
+    fn from(x: &IceConfiguration) -> Self {
         let mut is = vec!();
 
-        for s in x.ice_servers {
-            for u in s.urls {
+        for s in &x.ice_servers {
+            for u in &s.urls {
                 if u.starts_with("turn:") {
-                    is.push(format_ice_url(&u.replacen("turn:", "", 1), s.username, s.credential));
+                    is.push(format_ice_url(&u.replacen("turn:", "", 1), s.username.as_ref(), s.credential.as_ref()));
                 }
                 else {
                     is.push(u.to_string());
@@ -365,7 +366,7 @@ impl From<RtcIceTransportPolicy> for datachannel::TransportPolicy {
     }
 }
 
-fn format_ice_url(url: &str, username: Option<&str>, credential: Option<&str>) -> String {
+fn format_ice_url(url: &str, username: Option<&String>, credential: Option<&String>) -> String {
     let mut en = url.to_string();
 
     if let Some(x) = username {
@@ -376,10 +377,10 @@ fn format_ice_url(url: &str, username: Option<&str>, credential: Option<&str>) -
     "turn:".to_owned() + &en
 }
 
-impl From<&RtcDataChannelConfiguration<'_>> for datachannel::DataChannelInit {
-    fn from(x: &RtcDataChannelConfiguration<'_>) -> Self {
+impl From<&RtcDataChannelConfiguration> for datachannel::DataChannelInit {
+    fn from(x: &RtcDataChannelConfiguration) -> Self {
         Self::default()
-            .protocol(x.protocol.as_ref().copied().unwrap_or_default())
+            .protocol(x.protocol.as_ref().map(String::as_str).unwrap_or_default())
             .reliability(match x.reliability {
                 RtcReliabilityMode::Reliable() => datachannel::Reliability { unordered: !x.ordered, unreliable: false, max_packet_life_time: 0, max_retransmits: 0 },
                 RtcReliabilityMode::MaxRetransmits(t) => datachannel::Reliability { unordered: !x.ordered, unreliable: true, max_packet_life_time: 0, max_retransmits: t },

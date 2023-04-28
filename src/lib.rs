@@ -27,7 +27,7 @@
 //! 
 //! ```rust
 //! let ice_configuation = IceConfiguration {
-//!     ice_servers: &[RtcIceServer { urls: &[ "stun:stun.l.google.com:19302" ], ..Default::default() }],
+//!     ice_servers: vec!(RtcIceServer { urls: vec!("stun:stun.l.google.com:19302".to_string()), ..Default::default() }),
 //!     ice_transport_policy: RtcIceTransportPolicy::All
 //! };
 //! 
@@ -35,7 +35,7 @@
 //! 
 //! // Boths peers must use the same set of RtcDataChannelConfigurations for a connection to be created.
 //! let channel = RtcDataChannel::connect(&ice_configuation, negotiation_handler,
-//!     &[RtcDataChannelConfiguration { label: "chan", ..Default::default() }]
+//!     &[RtcDataChannelConfiguration { label: "chan".to_string(), ..Default::default() }]
 //! ).await.expect("An error occured during channel creation.")[0];
 //! 
 //! let msg = b"test msg";
@@ -50,6 +50,10 @@
 //! ## Optional features
 //! 
 //! **vendored** - Builds `libdatachannel` and `OpenSSL` statically on desktop platforms, bundling them into the build.
+//! **wasm_main_executor** - Allows for creating data channels within WASM web workers, and sharing them between threads.
+//! By default, restrictions on workers prevent them from instantiating and working with peer channels. This feature sidesteps
+//! said restrictions by deferring work to the main browser thread. When using this feature, `wasm_main_executor::initialize()`
+//! must be called before creating any data channels.
 
 #[deny(warnings)]
 
@@ -95,7 +99,7 @@ impl RtcDataChannel {
 
     /// Connects to a remote peer with the provided configuration and negotiator. If successful,
     /// returns the set of channels corresponding to the provided channel configurations.
-    pub async fn connect(config: &IceConfiguration<'_>, negotiator: impl RtcNegotiationHandler, channels: &[RtcDataChannelConfiguration<'_>]) -> Result<Box<[Self]>, RtcPeerConnectionError> {
+    pub async fn connect(config: &IceConfiguration, negotiator: impl RtcNegotiationHandler, channels: &[RtcDataChannelConfiguration]) -> Result<Box<[Self]>, RtcPeerConnectionError> {
         backend::RtcDataChannelBackendImpl::connect(config, negotiator, channels).await
     }
 
@@ -226,23 +230,23 @@ pub struct RtcSessionDescription {
 
 /// Describes the set of ICE servers and protocols that should be employed
 /// during connection establishment.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-pub struct IceConfiguration<'a> {
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IceConfiguration {
     /// The set of ICE servers that should be used to gather connection candidates.
-    pub ice_servers: &'a [RtcIceServer<'a>],
+    pub ice_servers: Vec<RtcIceServer>,
     /// The subset of ICE transports that should be considered.
     pub ice_transport_policy: RtcIceTransportPolicy,
 }
 
 /// Describes a server that may be utilized for peer-to-peer route discovery or communication.
-#[derive(Copy, Clone, Default, PartialEq, Debug)]
-pub struct RtcIceServer<'a> {
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct RtcIceServer {
     /// The set of URLs that may be used to connect to the server.
-    pub urls: &'a [&'a str],
+    pub urls: Vec<String>,
     /// The optional username that should be employed when connecting to the server.
-    pub username: Option<&'a str>,
+    pub username: Option<String>,
     /// The optional credential that should be employed when connecting to the server.
-    pub credential: Option<&'a str>
+    pub credential: Option<String>
 }
 
 /// Determines the subset of ICE functionality that should be considered.
@@ -272,19 +276,19 @@ pub enum RtcReliabilityMode {
 
 /// Describes how a channel should be created.
 #[derive(Clone)]
-pub struct RtcDataChannelConfiguration<'a> {
-    pub label: &'a str,
+pub struct RtcDataChannelConfiguration {
+    pub label: String,
     /// Whether messages on the channel should be ordered or unordered.
     pub ordered: bool,
     /// How the data channel should deal with dropped messages and retransmissions.
     pub reliability: RtcReliabilityMode,
     /// The subprotocol that should be employed during data transmission.
-    pub protocol: Option<&'a str>,
+    pub protocol: Option<String>,
 }
 
-impl<'a> Default for RtcDataChannelConfiguration<'a> {
+impl Default for RtcDataChannelConfiguration {
     fn default() -> Self {
-        Self { label: "", ordered: true, reliability: RtcReliabilityMode::Reliable(), protocol: None }
+        Self { label: "".to_string(), ordered: true, reliability: RtcReliabilityMode::Reliable(), protocol: None }
     }
 }
 
@@ -323,16 +327,10 @@ impl<'a> Future for RtcDataChannelReceiveFuture<'a> {
     type Output = Result<Box<[u8]>, RtcDataChannelError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.handle.receive_waker().store(Some(Arc::new(cx.waker().clone())));
         match self.0.receive() {
             Ok(Some(res)) => Poll::Ready(Ok(res)),
-            Ok(None) => { 
-                self.0.handle.receive_waker().store(Some(Arc::new(cx.waker().clone())));
-                match self.0.receive() {
-                    Ok(Some(res)) => Poll::Ready(Ok(res)),
-                    Ok(None) => Poll::Pending,
-                    Err(err) => Poll::Ready(Err(err))
-                }
-            },
+            Ok(None) => Poll::Pending,
             Err(err) => Poll::Ready(Err(err))
         }
     }
@@ -347,7 +345,7 @@ type RtcDataChannelConnectionFuture<'a> = Pin<Box<dyn 'a + Future<Output = Resul
 /// Provides the backing functionality for a data channel.
 trait RtcDataChannelBackend {
     /// Attempts to connect to a remote peer with the provided configuration, returning the newly-created set of channels for the peer.
-    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a>;
+    fn connect<'a>(config: &'a IceConfiguration, negotiator: impl RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration]) -> RtcDataChannelConnectionFuture<'a>;
     /// Determines the channel's current connection state.
     fn ready_state(&self) -> RtcDataChannelReadyState;
     /// Sends a message to the remote host.

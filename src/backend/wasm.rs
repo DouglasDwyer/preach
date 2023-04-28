@@ -11,7 +11,11 @@ use wasm_bindgen_futures::*;
 pub struct RtcDataChannelBackendImpl {
     handle: Option<Arc<SendWrapper<RtcDataChannelHandle>>>,
     ready_state: Arc<AtomicU8>,
-    receive_waker: Arc<ArcSwapOption<Waker>>
+    receive_waker: Arc<ArcSwapOption<Waker>>,
+    #[allow(dead_code)]
+    main_message_send: Sender<Vec<u8>>,
+    #[allow(dead_code)]
+    main_message_recv: Arc<Mutex<Receiver<Vec<u8>>>>
 }
 
 impl RtcDataChannelBackendImpl {
@@ -19,36 +23,45 @@ impl RtcDataChannelBackendImpl {
     fn new(handle: web_sys::RtcDataChannel, open_count: Arc<AtomicUsize>) -> (Self, RtcDataChannelMessageReceiver) {
         handle.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
         let (event_handlers, state) = RtcDataChannelEventHandlers::new(handle.clone(), open_count);
+        let (main_message_send, recv) = channel();
 
         (Self {
             handle: Some(Arc::new(SendWrapper::new(RtcDataChannelHandle { event_handlers, handle }))),
             ready_state: state.ready_state,
-            receive_waker: state.receive_waker
+            receive_waker: state.receive_waker,
+            main_message_send,
+            main_message_recv: Arc::new(Mutex::new(recv))
         }, state.receiver)
     }
 
+    /// Gets a reference to the underlying data channel handle.
     fn handle(&self) -> &Arc<SendWrapper<RtcDataChannelHandle>> {
         self.handle.as_ref().expect("Handle was already disposed.")
     }
 
+    /// Copies the provided message to a separate Javascript array, and then sends it on the given channel.
+    #[allow(dead_code)]
     fn copy_send_with_handle(handle: &web_sys::RtcDataChannel, message: &[u8]) -> Result<(), RtcDataChannelError> {
         let buffer = ArrayBuffer::new(message.len().try_into().expect("Message was too large to be sent."));
         Uint8Array::new(&buffer).copy_from(message);
         handle.send_with_array_buffer(&buffer).map_err(|x| RtcDataChannelError::Send(format!("{x:?}")))
     }
 
+    /// Determines whether this is the main browser thread.
     fn is_main_thread() -> bool {
         web_sys::window().is_some()
     }
 }
 
 impl RtcDataChannelBackend for RtcDataChannelBackendImpl {
-    fn connect<'a>(config: &'a IceConfiguration<'a>, negotiator: impl RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration<'a>]) -> RtcDataChannelConnectionFuture<'a> {
+    fn connect<'a>(config: &'a IceConfiguration, negotiator: impl RtcNegotiationHandler, channels: &'a [RtcDataChannelConfiguration]) -> RtcDataChannelConnectionFuture<'a> {
+        let config_ref = config.clone();
+        let channel_ref = channels.to_vec();
         if Self::is_main_thread() {
-            Box::pin(RtcPeerConnector::connect(config, negotiator, channels))
+            Box::pin(RtcPeerConnector::connect(config_ref, negotiator, channel_ref))
         }
         else {
-            Box::pin(spawn(FnFuture(|| RtcPeerConnector::connect(config, negotiator, channels))))
+            Box::pin(spawn(FnFuture(move || RtcPeerConnector::connect(config_ref, negotiator, channel_ref))))
         }
     }
 
@@ -57,29 +70,31 @@ impl RtcDataChannelBackend for RtcDataChannelBackendImpl {
     }
 
     fn send(&mut self, message: &[u8]) -> Result<(), RtcDataChannelError> {
-        #[cfg(not(target_feature = "atomics"))]
+        #[cfg(target_feature = "atomics")]
         {
             let handle = self.handle();
             if handle.valid() {
                 Self::copy_send_with_handle(&handle.handle, message)
             }
             else {
-                let message_ref = message.to_vec();
+                drop(self.main_message_send.send(message.to_vec()));
                 let handle_ref = handle.clone();
-                spawn(async move {
-                    if let Some((err, f)) = Self::copy_send_with_handle(&handle_ref.handle, &message_ref[..]).err()
+                let recv_ref = self.main_message_recv.clone();
+                drop(spawn(async move {
+                    if let Some((err, f)) = Self::copy_send_with_handle(&handle_ref.handle,
+                        &recv_ref.lock().expect("Could not acquire sending mutex.").try_recv().expect("Could not get next message to send")[..]).err()
                         .and_then(|t| handle_ref.handle.onerror().map(|f| (t, f))) {
                         drop(f.call1(&JsValue::NULL, &JsValue::from_str(&err.to_string())));
                     }
-                });
+                }));
 
                 Ok(())
             }
         }
-        /*#[cfg(not(target_feature = "atomics"))]
+        #[cfg(not(target_feature = "atomics"))]
         {
             self.handle().handle.send_with_u8_array(message).map_err(|x| RtcDataChannelError::Send(format!("{x:?}")))
-        }*/
+        }
     }
 
     fn receive_waker(&mut self) -> Arc<ArcSwapOption<Waker>> {
@@ -91,22 +106,27 @@ impl Drop for RtcDataChannelBackendImpl {
     fn drop(&mut self) {
         if !self.handle().valid() {
             let handle = take(&mut self.handle).expect("Handle was already disposed.");
-            spawn(async move { drop(handle); });
+            drop(spawn(async move { drop(handle); }));
         }
     }
 }
 
+/// Stores the set of data channel objects that must remain on the main thread.
 struct RtcDataChannelHandle {
+    /// The set of handlers that respond to WebRTC events.
+    #[allow(dead_code)]
     pub event_handlers: RtcDataChannelEventHandlers,
+    /// The underlying data channel.
     pub handle: web_sys::RtcDataChannel,
 }
 
+#[allow(dead_code)]
 /// Responds to events that occur on a data channel.
 struct RtcDataChannelEventHandlers {
     handle: web_sys::RtcDataChannel,
-    _on_close: Closure<dyn FnMut(JsValue)>,
-    _on_message: Closure<dyn FnMut(web_sys::MessageEvent)>,
-    _on_open: Closure<dyn FnMut(JsValue)>,
+    on_close: Closure<dyn FnMut(JsValue)>,
+    on_message: Closure<dyn FnMut(web_sys::MessageEvent)>,
+    on_open: Closure<dyn FnMut(JsValue)>,
 }
 
 impl RtcDataChannelEventHandlers {
@@ -145,9 +165,10 @@ impl RtcDataChannelEventHandlers {
         handle.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
         handle.set_onopen(Some(on_open.as_ref().unchecked_ref()));
         
-        (Self { handle, _on_close: on_close, _on_message: on_message, _on_open: on_open }, RtcDataChannelHandlerState { ready_state, receive_waker, receiver })
+        (Self { handle, on_close, on_message, on_open }, RtcDataChannelHandlerState { ready_state, receive_waker, receiver })
     }
 
+    /// Wakes the provided listener, if any.
     fn wake_listener(waker: &ArcSwapOption<Waker>) {
         if let Some(waker) = &*waker.load() {
             waker.wake_by_ref();
@@ -193,22 +214,23 @@ enum RtcNegotiationNotification {
 }
 
 /// Manages the establishment of a connection with a remote peer.
-struct RtcPeerConnector<'a, N: RtcNegotiationHandler> {
-    channel_configurations: &'a [RtcDataChannelConfiguration<'a>],
-    _event_handlers: RtcPeerConnectionEventHandlers,
+struct RtcPeerConnector<N: RtcNegotiationHandler> {
+    channel_configurations: Vec<RtcDataChannelConfiguration>,
+    #[allow(dead_code)]
+    event_handlers: RtcPeerConnectionEventHandlers,
     handle: web_sys::RtcPeerConnection,
     negotiator: N,
     negotiation_receive: Receiver<RtcNegotiationNotification>
 }
 
-impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
+impl<N: RtcNegotiationHandler> RtcPeerConnector<N> {
     /// Creates a new connector for the given configuration, negotiator, and channels.
-    pub async fn connect(configuration: &'a IceConfiguration<'a>, negotiator: N, channel_configurations: &'a [RtcDataChannelConfiguration<'a>]) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
+    pub async fn connect(configuration: IceConfiguration, negotiator: N, channel_configurations: Vec<RtcDataChannelConfiguration>) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
         let (negotiation_send, negotiation_receive) = channel();
         let handle = web_sys::RtcPeerConnection::new_with_configuration(&configuration.into()).map_err(|x| RtcPeerConnectionError::Creation(format!("{x:?}")))?;
         let event_handlers = RtcPeerConnectionEventHandlers::new(handle.clone(), negotiation_send);
 
-        Self { channel_configurations, _event_handlers: event_handlers, handle, negotiator, negotiation_receive }.accept_connections().await
+        Self { channel_configurations, event_handlers, handle, negotiator, negotiation_receive }.accept_connections().await
     }
 
     /// Performs ICE with the remote peer and attempts to create a set of data channels.
@@ -225,11 +247,11 @@ impl<'a, N: RtcNegotiationHandler> RtcPeerConnector<'a, N> {
         let mut channels = Vec::new();
         let open_count = Arc::<AtomicUsize>::default();
 
-        for config in self.channel_configurations {
+        for config in &self.channel_configurations {
             let (handler, receiver) = RtcDataChannelBackendImpl::new(
-                self.handle.create_data_channel_with_data_channel_dict(config.label, web_sys::RtcDataChannelInit::from(config).id(channels.len() as u16)), open_count.clone());
+                self.handle.create_data_channel_with_data_channel_dict(&config.label, web_sys::RtcDataChannelInit::from(config).id(channels.len() as u16)), open_count.clone());
 
-            channels.push(RtcDataChannel::new(handler, config.label.to_string(), channels.len() as u16, receiver));
+            channels.push(RtcDataChannel::new(handler, config.label.clone(), channels.len() as u16, receiver));
         }
 
         Ok(RtcDataChannelList { channels, open_count })
@@ -441,14 +463,14 @@ pub fn spawn<F: 'static + IntoFuture + Send>(_: F) -> F::IntoFuture {
     panic!("Attempted to create data channel on worker thread without enabling the wasm_main_executor feature.")
 }
 
-impl From<&IceConfiguration<'_>> for web_sys::RtcConfiguration {
-    fn from(config: &IceConfiguration<'_>) -> Self {
+impl From<IceConfiguration> for web_sys::RtcConfiguration {
+    fn from(config: IceConfiguration) -> Self {
         let ice_servers = Array::new();
         for s in config.ice_servers {
             let urls = Array::new();
 
-            for &u in s.urls {
-                urls.push(&JsString::from(u));
+            for u in &s.urls {
+                urls.push(&JsString::from(u.as_str()));
             }
 
             let mut ice_server = web_sys::RtcIceServer::new();
@@ -482,8 +504,8 @@ impl From<RtcIceTransportPolicy> for web_sys::RtcIceTransportPolicy {
     }
 }
 
-impl From<&RtcDataChannelConfiguration<'_>> for web_sys::RtcDataChannelInit {
-    fn from(x: &RtcDataChannelConfiguration<'_>) -> Self {
+impl From<&RtcDataChannelConfiguration> for web_sys::RtcDataChannelInit {
+    fn from(x: &RtcDataChannelConfiguration) -> Self {
         let mut ret = web_sys::RtcDataChannelInit::new();
         
         ret.ordered(x.ordered);

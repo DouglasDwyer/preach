@@ -27,12 +27,12 @@ impl RtcNegotiationHandler for ChannelNegotiationHandler {
 
 async fn create_channels(handler: ChannelNegotiationHandler) -> Result<Box<[RtcDataChannel]>, RtcPeerConnectionError> {
     let ice_configuation = IceConfiguration {
-        ice_servers: &[RtcIceServer { urls: &[ "stun:stun.l.google.com:19302" ], ..Default::default() }],
+        ice_servers: vec!(RtcIceServer { urls: vec!("stun:stun.l.google.com:19302".to_string()), ..Default::default() }),
         ice_transport_policy: RtcIceTransportPolicy::All
     };
 
     RtcDataChannel::connect(&ice_configuation, handler,
-        &[RtcDataChannelConfiguration { label: "chan", ..Default::default() }]
+        &[RtcDataChannelConfiguration { label: "chan".to_string(), ..Default::default() }]
     ).await
 }
 
