@@ -120,6 +120,12 @@ struct RtcDataChannelHandle {
     pub handle: web_sys::RtcDataChannel,
 }
 
+impl Drop for RtcDataChannelHandle {
+    fn drop(&mut self) {
+        self.handle.close();
+    }
+}
+
 #[allow(dead_code)]
 /// Responds to events that occur on a data channel.
 struct RtcDataChannelEventHandlers {
